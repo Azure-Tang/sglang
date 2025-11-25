@@ -464,6 +464,14 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             shared_output = self._forward_shared_experts(hidden_states)
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
+
+            # Hook for Fisher Calibration
+            try:
+                from sglang.srt.models.fisher_collector import collector
+                collector.update(self.layer_id, router_logits, hidden_states, self.top_k)
+            except ImportError:
+                pass
+
             topk_output = self.topk(hidden_states, router_logits)
         else:
             shared_output = None
