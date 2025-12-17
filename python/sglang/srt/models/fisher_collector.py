@@ -25,6 +25,12 @@ class FisherCollector:
         self.co_activation_device = {}
 
     def update(self, layer_id, router_logits, hidden_states, top_k):
+        # Check environment variable dynamically (for spawn-based multiprocessing)
+        if not self.enabled:
+            self.enabled = os.environ.get("ENABLE_FISHER_CALIBRATION") == "1"
+            if self.enabled:
+                self.save_path = os.environ.get("FISHER_SAVE_PATH", "/tmp/fisher_stats.pt")
+                print(f"[Fisher] Enabled collector in subprocess, save_path={self.save_path}")
         if not self.enabled:
             return
 

@@ -446,7 +446,6 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
-
         if not get_moe_a2a_backend().is_deepep():
             return self.forward_normal(
                 hidden_states, should_allreduce_fusion, use_reduce_scatter
