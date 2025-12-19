@@ -15,6 +15,7 @@
 """Inference-only GLM-4.5, GLM-4.6 model compatible with HuggingFace weights"""
 
 import logging
+import os
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -61,7 +62,7 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK, TopKOutputChecker
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -97,6 +98,32 @@ _is_cpu = is_cpu()
 _device_sm = get_device_sm()
 
 logger = logging.getLogger(__name__)
+
+
+class BasisWeightCache:
+    """
+    Global cache for basis weight files.
+
+    Avoids loading the same basis file 45 times (once per layer).
+    The file is loaded once and cached; subsequent layers get their data from cache.
+    """
+    _cache: Dict[str, Dict] = {}
+
+    @classmethod
+    def get_layer_data(cls, path: str, layer_id: int) -> Dict:
+        """Get layer-specific data from cached basis file."""
+        if path not in cls._cache:
+            logger.info(f"BasisWeightCache: Loading basis file {path} (will be shared by all layers)")
+            cls._cache[path] = torch.load(path, map_location='cpu', weights_only=True)
+        return cls._cache[path][layer_id]
+
+    @classmethod
+    def clear_cache(cls, path: str = None):
+        """Clear cache (optional, for memory management)."""
+        if path:
+            cls._cache.pop(path, None)
+        else:
+            cls._cache.clear()
 
 
 class Glm4MoeMLP(nn.Module):
@@ -340,6 +367,130 @@ class Glm4MoeGate(nn.Module):
         return logits
 
 
+class HybridBasisMLP(nn.Module):
+    """
+    Hybrid MoE Basis MLP module.
+
+    Computes the contribution of dropped experts using shared basis functions.
+    This allows approximating the dropped experts' outputs efficiently.
+
+    Computation flow:
+    1. Compute mixing coefficients from projector and dropped expert probs
+    2. Apply basis input projection (gate_up)
+    3. Apply SwiGLU activation
+    4. Apply basis output projection
+    5. Weight and sum across basis functions
+    """
+
+    def __init__(
+        self,
+        layer_id: int,
+        hidden_size: int,
+        intermediate_size: int,
+        num_experts: int,
+        basis_path: str,
+    ):
+        super().__init__()
+        self.layer_id = layer_id
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.num_experts = num_experts
+
+        # Load basis weights for this layer (using global cache)
+        logger.info(f"HybridBasisMLP: Initializing layer {layer_id}")
+        layer_data = BasisWeightCache.get_layer_data(basis_path, layer_id)
+
+        # basis_in: [M, 2*inter, hidden]
+        # basis_out: [M, hidden, inter]
+        # projector: [num_experts, M]
+        self.num_basis = layer_data['num_basis']
+
+        # Register projector as buffer
+        self.register_buffer(
+            'projector',
+            layer_data['projector'].half()
+        )
+
+        # Pre-compute transposed matrices for optimized forward
+        # basis_in: [M, 2*inter, hidden] -> basis_in_T: [hidden, M*2*inter]
+        basis_in = layer_data['basis_in'].half()  # [M, 2*inter, hidden]
+        basis_in_flat = basis_in.view(-1, hidden_size)  # [M*2*inter, hidden]
+        self.register_buffer('basis_in_T', basis_in_flat.T.contiguous())  # [hidden, M*2*inter]
+
+        # basis_out: [M, hidden, inter] -> basis_out_T: [M, inter, hidden]
+        basis_out = layer_data['basis_out'].half()  # [M, hidden, inter]
+        self.register_buffer('basis_out_T', basis_out.permute(0, 2, 1).contiguous())  # [M, inter, hidden]
+
+        logger.info(
+            f"HybridBasisMLP layer {layer_id}: "
+            f"num_basis={self.num_basis}, "
+            f"basis_in_T={self.basis_in_T.shape}, "
+            f"basis_out_T={self.basis_out_T.shape}, "
+            f"projector={self.projector.shape}"
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        dropped_indices: torch.Tensor,
+        dropped_probs: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            hidden_states: [batch_size, hidden_dim] - Input hidden states
+            dropped_indices: [batch_size, K-k_sparse] - Indices of dropped experts
+            dropped_probs: [batch_size, K-k_sparse] - Probabilities of dropped experts
+
+        Returns:
+            output: [batch_size, hidden_dim] - Weighted sum of basis outputs
+
+        Optimized implementation using pre-computed transposed matrices.
+        """
+        batch_size = hidden_states.shape[0]
+
+        if batch_size == 0:
+            return hidden_states
+
+        # Ensure buffers are on the correct device (lazy move on first forward)
+        if self.projector.device != hidden_states.device:
+            self.projector = self.projector.to(device=hidden_states.device, dtype=hidden_states.dtype)
+            self.basis_in_T = self.basis_in_T.to(device=hidden_states.device, dtype=hidden_states.dtype)
+            self.basis_out_T = self.basis_out_T.to(device=hidden_states.device, dtype=hidden_states.dtype)
+
+        # Convert dropped_probs to match hidden_states dtype
+        dropped_probs = dropped_probs.to(dtype=hidden_states.dtype)
+
+        M = self.num_basis
+
+        # 1. Compute mixing coefficients: [B, M]
+        # projector: [num_experts, M], dropped_indices: [B, K-k_sparse]
+        proj_gathered = self.projector[dropped_indices]  # [B, K-k_sparse, M]
+        coeffs = (dropped_probs.unsqueeze(-1) * proj_gathered).sum(dim=1)  # [B, M]
+
+        # 2. Input Projection - using pre-computed basis_in_T: [hidden, M*2*inter]
+        # hidden_states: [B, hidden] @ basis_in_T: [hidden, M*2*inter] -> [B, M*2*inter]
+        H_in_flat = hidden_states @ self.basis_in_T  # [B, M*2*inter]
+        H_in = H_in_flat.view(batch_size, M, -1)  # [B, M, 2*inter]
+
+        # 3. SwiGLU Activation
+        gate_up_size = H_in.shape[2]
+        half_size = gate_up_size // 2
+        gate = H_in[:, :, :half_size]  # [B, M, inter]
+        up = H_in[:, :, half_size:]    # [B, M, inter]
+        H_act = F.silu(gate) * up  # [B, M, inter]
+
+        # 4. Output Projection - using pre-computed basis_out_T: [M, inter, hidden]
+        # bmm: [M, B, inter] @ [M, inter, hidden] -> [M, B, hidden]
+        H_act_t = H_act.permute(1, 0, 2).contiguous()  # [M, B, inter]
+        Y_raw_t = torch.bmm(H_act_t, self.basis_out_T)  # [M, B, hidden]
+        Y_raw = Y_raw_t.permute(1, 0, 2)  # [B, M, hidden]
+
+        # 5. Weighted Sum: [B, hidden]
+        output = (coeffs.unsqueeze(-1) * Y_raw).sum(dim=1)  # [B, hidden]
+
+        return output
+
+
 class Glm4MoeSparseMoeBlock(nn.Module):
     def __init__(
         self,
@@ -432,6 +583,34 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
         )
 
+        # Hybrid MoE configuration
+        self.hybrid_enabled = os.environ.get("SGLANG_ENABLE_HYBRID_MOE", "0") == "1"
+        self.hybrid_basis_mlp = None
+        self.k_sparse = int(os.environ.get("SGLANG_HYBRID_K_SPARSE", "2"))
+
+        if self.hybrid_enabled:
+            basis_path = os.environ.get("SGLANG_HYBRID_BASIS_PATH", "")
+            if not basis_path:
+                raise ValueError(
+                    "SGLANG_HYBRID_BASIS_PATH must be set when SGLANG_ENABLE_HYBRID_MOE=1"
+                )
+
+            if not os.path.exists(basis_path):
+                raise FileNotFoundError(f"Basis file not found: {basis_path}")
+
+            self.hybrid_basis_mlp = HybridBasisMLP(
+                layer_id=layer_id,
+                hidden_size=config.hidden_size,
+                intermediate_size=config.moe_intermediate_size,
+                num_experts=config.n_routed_experts,
+                basis_path=basis_path,
+            )
+
+            logger.info(
+                f"Hybrid MoE enabled for layer {layer_id}: "
+                f"k_sparse={self.k_sparse}, top_k={self.top_k}"
+            )
+
     def get_moe_weights(self):
         return [
             x.data
@@ -469,10 +648,64 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             shared_output = None
             topk_output = self.topk.empty_topk_output(hidden_states.device)
 
-        final_hidden_states = self.experts(hidden_states, topk_output)
+        # Hybrid MoE: split top-k into sparse and dropped parts
+        basis_output = None
+        if (
+            self.hybrid_enabled
+            and self.hybrid_basis_mlp is not None
+            and hidden_states.shape[0] > 0
+            and TopKOutputChecker.format_is_standard(topk_output)
+        ):
+            # Only implemented for StandardTopKOutput format
+            # topk_output.topk_ids: [B, K]
+            # topk_output.topk_weights: [B, K]
+            # Split into sparse (keep) and dropped parts
+            sparse_ids = topk_output.topk_ids[:, :self.k_sparse]
+            sparse_weights = topk_output.topk_weights[:, :self.k_sparse]
+            dropped_ids = topk_output.topk_ids[:, self.k_sparse:]
+            dropped_weights = topk_output.topk_weights[:, self.k_sparse:]
+
+            # Create new TopKOutput for sparse path only
+            sparse_topk = StandardTopKOutput(
+                topk_weights=sparse_weights,
+                topk_ids=sparse_ids,
+                router_logits=topk_output.router_logits,
+            )
+
+            # Execute sparse path with reduced top-k
+            sparse_output = self.experts(hidden_states, sparse_topk)
+
+            # Execute basis path for dropped experts
+            basis_output = self.hybrid_basis_mlp(
+                hidden_states, dropped_ids, dropped_weights
+            )
+
+            # TP handling: basis is replicated, so divide by tp_size before AllReduce
+            # sparse_output: Partial Sum (needs AllReduce)
+            # basis_output: Full Result (each rank computes full result)
+            # After AllReduce: sparse_total + basis * tp_size (wrong!)
+            # Correct: divide basis by tp_size first
+            if self.tp_size > 1:
+                basis_output = basis_output / self.tp_size
+
+            # Apply routed_scaling_factor to both outputs
+            # Note: On CUDA with biased_grouped_topk, the scaling is fused
+            if not _is_cuda and not _use_aiter:
+                sparse_output = sparse_output * self.routed_scaling_factor
+                basis_output = basis_output * self.routed_scaling_factor
+
+            # Combine sparse and basis outputs
+            final_hidden_states = sparse_output + basis_output
+        else:
+            # Original path: full top-k execution
+            final_hidden_states = self.experts(hidden_states, topk_output)
+
         if not _is_cuda and not _use_aiter:
             # fused in biased_grouped_topk so we can skip here
-            final_hidden_states *= self.routed_scaling_factor
+            # Only apply to sparse output if hybrid is enabled (basis already scaled)
+            if not (self.hybrid_enabled and self.hybrid_basis_mlp is not None and hidden_states.shape[0] > 0):
+                final_hidden_states *= self.routed_scaling_factor
+
         if shared_output is not None:
             with use_symmetric_memory(
                 parallel_state.get_tp_group(), disabled=not is_allocation_symmetric()
